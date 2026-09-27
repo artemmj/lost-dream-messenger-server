@@ -9,6 +9,7 @@ ALLOWED_HOSTS = [
     "localhost",
     "127.0.0.1",
     "0.0.0.0",
+    "10.0.2.2",
     "backend",  # Docker internal DNS
 ]
 

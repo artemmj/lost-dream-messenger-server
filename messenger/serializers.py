@@ -1,9 +1,10 @@
 from django.contrib.auth import get_user_model
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 # from django.contrib.auth.password_validation import validate_password
-from .models import Chat, Message
+from .models import Chat, Message, normalize_phone
 
 User = get_user_model()
 
@@ -48,6 +49,20 @@ class RegisterSerializer(serializers.ModelSerializer):
             )
         return normalized
 
+    def validate_phone(self, value: str) -> str:
+        # Нормализуем до записи в БД: `username` по умолчанию берётся из телефона
+        # (см. create), а он unique — сырое «+7 (999) …» разошлось бы с `phone`.
+        # Строка без цифр отклоняется: она нормализуется в "", и в такой аккаунт
+        # вошёл бы кто угодно по любому «abc».
+        normalized = normalize_phone(value)
+        if not normalized:
+            raise serializers.ValidationError("Телефон не может быть пустым.")
+        # Поле объявлено явно, поэтому DRF не подставляет к нему UniqueValidator —
+        # без этой проверки дубль падал бы IntegrityError'ом (500).
+        if User.objects.filter(phone=normalized).exists():
+            raise serializers.ValidationError("Пользователь с таким телефоном уже существует.")
+        return normalized
+
     def validate_username(self, value: str) -> str:
         value = value.strip()
         if value and User.objects.filter(username__iexact=value).exists():
@@ -86,6 +101,18 @@ class RegisterResponseSerializer(serializers.Serializer):
     refresh = serializers.CharField()
 
 
+class LoginSerializer(TokenObtainPairSerializer):
+    """
+    Логин по телефону. Нормализация обязательна: в БД телефон лежит в каноническом
+    виде (только цифры, см. normalize_phone), а аутентификация сравнивает строку как
+    есть — без неё вход с "+7 999 999-99-11" дал бы 401 при верном пароле.
+    """
+
+    def validate(self, attrs: dict) -> dict:
+        attrs[self.username_field] = normalize_phone(attrs[self.username_field])
+        return super().validate(attrs)
+
+
 class MeSerializer(serializers.ModelSerializer):
     """Сериалайзер профиля текущего пользователя. Read-only."""
 
@@ -112,10 +139,9 @@ class ProfileUpdateSerializer(serializers.ModelSerializer):
         fields = ("phone", "email", "first_name", "last_name")
 
     def validate_phone(self, value: str) -> str:
-        # Та же нормализация, что в UserManager.create_user: логин ищется по
-        # «чистому» телефону, поэтому запись с пробелами/скобками выбила бы
-        # пользователя из входа.
-        normalized = "".join(c for c in value if c.isdigit() or c == "+")
+        # Нормализация обязательна: по «чистому» телефону пользователь входит, запись
+        # с пробелами/скобками выбила бы его из входа.
+        normalized = normalize_phone(value)
         if not normalized:
             raise serializers.ValidationError("Телефон не может быть пустым.")
         if self._others_exist(phone=normalized):

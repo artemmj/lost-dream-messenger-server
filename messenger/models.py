@@ -6,6 +6,14 @@ from django.utils import timezone
 from config import settings
 
 
+def normalize_phone(value: str) -> str:
+    """
+    Канонический вид телефона: только цифры, без `+` и разделителей.
+    Используется и при записи, и при входе — `phone` ищется точным совпадением.
+    """
+    return "".join(c for c in value if c.isdigit())
+
+
 class UserManager(BaseUserManager):
     """
     Кастомный менеджер пользователей.
@@ -22,8 +30,7 @@ class UserManager(BaseUserManager):
         if not phone:
             raise ValueError("Телефон обязателен")
 
-        # Нормализация телефона: убираем пробелы, скобки, дефисы
-        phone = "".join(c for c in phone if c.isdigit() or c == "+")
+        # Канонический вид телефону задаёт User.save()
 
         # email может быть None или пустой строкой — нормализуем
         email = extra_fields.pop("email", None)
@@ -79,6 +86,13 @@ class User(AbstractUser):
     class Meta:
         verbose_name = "Пользователь"
         verbose_name_plural = "Пользователи"
+
+    def save(self, *args, **kwargs):
+        # Нормализуем на сохранении, а не только в менеджере: телефон — логин, и
+        # канонический вид должен обеспечиваться и для админки, и для shell, и для
+        # фикстур, иначе вход перестанет находить аккаунт.
+        self.phone = normalize_phone(self.phone)
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return self.first_name or self.phone

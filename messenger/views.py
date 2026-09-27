@@ -17,7 +17,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
 from .consumers import message_payload, publish_new_message, publish_to_users
-from .models import Chat, Membership, Message
+from .models import Chat, Membership, Message, normalize_phone
 from .readstate import unread_counts
 from .serializers import (
     AddMemberSerializer,
@@ -25,6 +25,7 @@ from .serializers import (
     ChatDetailSerializer,
     ChatListSerializer,
     ChatRenameSerializer,
+    LoginSerializer,
     MeSerializer,
     MessageCreateSerializer,
     MessageSerializer,
@@ -582,6 +583,7 @@ class RegisterView(generics.CreateAPIView):
 class LoginView(TokenObtainPairView):
     # Сабкласс только чтобы задать throttle_scope: brute-force паролей — главный вектор
     throttle_scope = "auth"
+    serializer_class = LoginSerializer
 
 
 class RefreshView(TokenRefreshView):
@@ -619,12 +621,15 @@ class UserSearchView(generics.ListAPIView):
 
         from django.db.models import Q
 
-        return User.objects.filter(
-            Q(phone__icontains=query)
-            | Q(first_name__icontains=query)
-            | Q(last_name__icontains=query)
-        ).exclude(id=self.request.user.id)[:20]  # Максимум 20 результатов
+        # Телефон ищем по цифрам: в БД он лежит в каноническом виде, поэтому запрос
+        # "+7 999" или "7-999" без нормализации не нашёл бы никого.
+        digits = normalize_phone(query)
+        conditions = Q(first_name__icontains=query) | Q(last_name__icontains=query)
+        if digits:
+            conditions |= Q(phone__icontains=digits)
 
+        qs = User.objects.filter(conditions).exclude(id=self.request.user.id)
+        return qs[:20]  # Максимум 20 результатов
 
 class MeView(APIView):
     """

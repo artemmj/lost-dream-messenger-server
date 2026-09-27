@@ -39,14 +39,24 @@ async function handleSubmit() {
       <h2>{{ isRegister ? 'Регистрация' : 'Вход' }}</h2>
       <div v-if="auth.error" class="error-msg">{{ auth.error }}</div>
       <form @submit.prevent="handleSubmit">
-        <input v-model="form.phone" class="form-input" placeholder="Телефон (+79991234567)" required />
+        <!-- name/autocomplete обязательны: без них браузер угадывает поля и подставляет
+             в логин сохранённую учётку от другой записи → 401 при верном пароле -->
+        <input v-model="form.phone" class="form-input" name="phone" type="tel"
+               autocomplete="username" placeholder="Телефон (+79991234567)" required />
         <template v-if="isRegister">
-          <input v-model="form.email" class="form-input" placeholder="Email (необязательно)" type="email" />
-          <input v-model="form.first_name" class="form-input" placeholder="Имя (необязательно)" />
-          <input v-model="form.last_name" class="form-input" placeholder="Фамилия (необязательно)" />
+          <input v-model="form.email" class="form-input" name="email" type="email"
+                 autocomplete="email" placeholder="Email (необязательно)" />
+          <input v-model="form.first_name" class="form-input" name="first_name"
+                 autocomplete="given-name" placeholder="Имя (необязательно)" />
+          <input v-model="form.last_name" class="form-input" name="last_name"
+                 autocomplete="family-name" placeholder="Фамилия (необязательно)" />
         </template>
-        <input v-model="form.password" class="form-input" type="password" placeholder="Пароль" required />
-        <input v-if="isRegister" v-model="form.password_confirm" class="form-input" type="password" placeholder="Подтвердите пароль" required />
+        <input v-model="form.password" class="form-input" name="password" type="password"
+               :autocomplete="isRegister ? 'new-password' : 'current-password'"
+               placeholder="Пароль" required />
+        <input v-if="isRegister" v-model="form.password_confirm" class="form-input"
+               name="password_confirm" type="password" autocomplete="new-password"
+               placeholder="Подтвердите пароль" required />
         <button class="btn-primary" :disabled="auth.isLoading">
           {{ auth.isLoading ? '...' : isRegister ? 'Зарегистрироваться' : 'Войти' }}
         </button>
