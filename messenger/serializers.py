@@ -1,10 +1,12 @@
+import re
+
 from django.contrib.auth import get_user_model
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 # from django.contrib.auth.password_validation import validate_password
-from .models import Chat, Message, normalize_phone
+from .models import Chat, DeviceToken, Message, normalize_phone
 
 User = get_user_model()
 
@@ -395,3 +397,94 @@ class PrivateChatCreateSerializer(serializers.Serializer):
         if not User.objects.filter(id=value).exists():
             raise serializers.ValidationError("Пользователь с таким ID не найден.")
         return value
+
+
+# --- Push-токены устройств ----------------------------------------------------
+
+# FCM registration token — длинная строка из латиницы и `-` `.` `:` `=` `_`.
+# `\Z` вместо `$`: у `$` есть сюрприз — он пропускает завершающий перевод строки.
+FCM_TOKEN_RE = re.compile(r"[A-Za-z0-9_.:=\-]{20,512}\Z")
+
+
+def validate_fcm_token(value: str) -> str:
+    """
+    Формальная проверка токена до обращения к FCM.
+
+    Мусор дешевле отклонить на входе 400: на невалидный формат FCM отвечает
+    `InvalidArgumentError`, а наш разбор таких ответов деактивирует токен — то
+    есть опечатка в клиенте выглядела бы как «устройство само отвалилось».
+    """
+    token = (value or "").strip()
+    if not FCM_TOKEN_RE.match(token):
+        raise serializers.ValidationError(
+            "Ожидается FCM registration token: 20–512 символов без пробелов."
+        )
+    return token
+
+
+class DeviceTokenSerializer(serializers.ModelSerializer):
+    """
+    Формат ответа про устройство.
+
+    Само значение `token` не отдаётся никогда: это секрет доставки, и его утечка
+    через список устройств позволяет чужому коду слать пользователю push.
+    """
+
+    class Meta:
+        model = DeviceToken
+        fields = (
+            "id",
+            "platform",
+            "is_active",
+            "app_version",
+            "created_at",
+            "last_seen_at",
+        )
+        read_only_fields = fields
+
+
+class DeviceTokenCreateSerializer(serializers.Serializer):
+    """Регистрация (upsert) токена текущего пользователя."""
+
+    token = serializers.CharField(
+        max_length=512,
+        help_text="FCM registration token устройства",
+    )
+    platform = serializers.ChoiceField(
+        choices=DeviceToken.Platform.choices,
+        default=DeviceToken.Platform.ANDROID,
+        required=False,
+    )
+    app_version = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=32,
+        default="",
+        help_text="Версия клиента — для диагностики «пришло/не пришло»",
+    )
+
+    def validate_token(self, value):
+        return validate_fcm_token(value)
+
+    def validate_app_version(self, value):
+        return (value or "").strip()
+
+
+class DeviceRevokeSerializer(serializers.Serializer):
+    """«Забудь это устройство» — по значению токена, когда uuid неизвестен."""
+
+    token = serializers.CharField(max_length=512)
+
+    def validate_token(self, value):
+        return validate_fcm_token(value)
+
+
+class TestPushSerializer(serializers.Serializer):
+    """Параметры тестового уведомления; оба поля опциональны — дефолты в push.py."""
+
+    title = serializers.CharField(
+        required=False, allow_blank=True, max_length=80, default=""
+    )
+    body = serializers.CharField(
+        required=False, allow_blank=True, max_length=200, default=""
+    )

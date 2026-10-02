@@ -13,6 +13,7 @@ Real-time мессенджер: бэкенд на Django (DRF + Channels), фр�
 | Database | PostgreSQL | 18 |
 | Cache/PubSub | Redis (channels_redis pub/sub) | 7 |
 | Auth | JWT (SimpleJWT) | 5.5 |
+| Push | Firebase Cloud Messaging (HTTP v1, `firebase-admin`) | 7.7 |
 | API Docs | drf-spectacular (OpenAPI 3.0) | — |
 | Frontend | Vue 3 + TypeScript + Pinia + Vue Router | 3.5 |
 | Build Tool | Vite | 8.x |
@@ -53,6 +54,16 @@ Real-time мессенджер: бэкенд на Django (DRF + Channels), фр�
 - События прочтения сообщений
 - Авто-reconnect при разрыве соединения (фиксированная задержка 2 c) с перечитыванием истории: сообщения, пришедшие пока сокет был разорван, добираются через REST. На коды отказа reconnect не распространяется: 4001 (JWT), 4003/4004 (вылет из чата / чат удалён), 4009/4029 (WS-лимиты)
 - JWT-аутентификация через query string (`?token=<jwt>`)
+
+### Push-уведомления (Android / FCM) — серверная часть
+- Реестр устройств `DeviceToken` + API: `POST /api/v1/devices/` (upsert FCM-токена, идемпотентен — можно слать на каждом старте), `GET /devices/`, `DELETE /devices/{id}/`, `POST /devices/revoke/` для logout. Значение токена наружу не отдаётся никогда
+- Рассылка «новое сообщение» через Firebase Cloud Messaging (HTTP v1) из той же точки, что и WS-уведомления, — поэтому REST- и WS-отправка уведомляют одинаково и по одному разу
+- **Только тем, у кого нет живого WebSocket-канала** (гейт по presence-хешу): открытая вкладка/устройство уже получил сообщение по WS, push поверх дал бы двойное уведомление
+- Гибрид `notification` + `data`: при убитом приложение показывает сам SDK, при живом клиент читает `data` (id чата, id сообщения, имя отправителя, счётчик) и строит навигацию по тапу. `tag` = id сообщения — повтор не плодит второе уведомление
+- Два канала: личный чат → высокий приоритет (заголовок — имя отправителя), групповой → низкий (заголовок — «название чата · отправитель»). Превью текста схлопывается и обрезается, к нему добавляется «· ещё N», у просроченных уведомлений TTL 4 часа
+- Отправка уходит в пул потоков, поэтому Daphne не ждёт Firebase, а сбой FCM не ломает WS-доставку; мёртвые токены гасятся (`UNREGISTERED`, `sender id mismatch`), при временном сбое (квота, 5xx) устройство остаётся активным
+- `POST /api/v1/notifications/test/` — тестовый push на свои устройства с честным отчётом `{sent, failed, deactivated}`, чтобы проверить маршруты и канал до клиента
+- Выключено по умолчанию (`PUSH_ENABLED=0`): `docker compose up` поднимается без Firebase-ключей. Включение — см. «Push: включение»
 
 ### Frontend (Vue 3 SPA)
 - Login/Register экраны, защищённые роуты (navigation guard)
@@ -98,15 +109,58 @@ Frontend в compose запускается в dev-режиме (Vite HMR). Prod-
 | http://localhost:8000/admin/ | Django Admin |
 | localhost:5434 | PostgreSQL (проброшен на хост) |
 
+### Push: включение
+
+По умолчанию push выключен, и без ключей всё поднимается как раньше. Чтобы включить:
+
+1. Firebase Console → проект → добавить Android-приложение с `applicationId` клиента → `google-services.json` — в клиента.
+2. Project settings → **Service accounts** → *Generate new private key* → сохранить JSON как `secrets/firebase-service-account.json` (каталог `secrets/` — в `.gitignore` и `.dockerignore`; в dev он виден в контейнере через bind-mount `.:/app`).
+3. В `.env`:
+   ```bash
+   PUSH_ENABLED=1
+   FIREBASE_PROJECT_ID=<project_id из ключа>
+   # вместо файла можно положить сам ключ (raw JSON или base64):
+   # FIREBASE_CREDENTIALS_JSON='{"project_id": "…", "private_key": "…"}'
+   ```
+   Креденшел через env предпочтительнее: `credentials.Certificate(путь)` отказывается читать файл с правами 644, а в bind-mount'е они именно такие.
+4. `docker compose up -d --build backend` (поднимется миграция `0005_device_token`).
+
+Проверка без клиента: зарегистрировать токен и послать тестовое уведомление —
+
+```bash
+curl -X POST http://localhost:8000/api/v1/devices/ \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"token": "<FCM-токен устройства из логов>"}'
+
+curl -X POST http://localhost:8000/api/v1/notifications/test/ \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"title": "Проверка канала"}'
+```
+
+Ответ — `{sent, failed, deactivated, recipients}`. `503` = push выключен или ключ не прочитан, `502` = FCM отверг запрос. Подробные форматы и ограничения — в [AGENTS.md](AGENTS.md) («📲 Push-уведомления»).
+
+### Тесты
+
+```bash
+docker compose exec backend python manage.py test          # 56 тестов: push-слой + UserManager
+ruff check .                                                # линт
+```
+
+Прогон сам освобождает сессии рабочих потоков перед удалением тестовой базы
+(`config/test_runner.py`) — иначе Postgres отказывает (`... is being accessed by
+other users`) и осколок базы блокирует следующий запуск.
+
 ## 📋 Планы развития
 - [x] In-app уведомления о новых сообщениях во всех чатах (личный WS-канал + бейдж непрочитанного)
 - [x] Онлайн-статус участников в групповых чатах (данные presence пришли бы и так — снимок при подключении + `user_status` во все группы чатов)
 - [x] Rate limiting для REST, WebSocket и nginx (`limit_req`/`limit_conn`) — см. «Защита от abuse»
-- [ ] Push notifications (веб-пуш при закрытой вкладке)
+- [x] Push notifications — серверная часть (реестр устройств, рассылка через FCM с presence-гейтом, тестовый эндпоинт) — см. «Push-уведомления»
+- [ ] Push на клиенте (Flutter/Android: локальные и запланированные уведомления, каналы, разрешения, навигация по тапу) и веб-пуш при закрытой вкладке
 - [ ] Typing indicators
 - [ ] Загрузка файлов и изображений
 - [ ] Message editing / deletion
-- [ ] Тесты (pytest + Vitest)
+- [x] Тесты бэкенда (56 тестов push-слоя и `UserManager` на `django.test.TestCase`, `manage.py test`)
+- [ ] Покрытие тестами остального API + Vitest для фронтенда
 - [ ] CI/CD pipeline
 - [ ] Настройки из env (SECRET_KEY, DEBUG) — сейчас захардкожены
 - [ ] Production deploy (nginx + SSL, prod-сервис frontend в compose)

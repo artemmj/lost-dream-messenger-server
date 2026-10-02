@@ -218,3 +218,11 @@ __marimo__/
 .streamlit/secrets.toml
 
 staticfiles/
+
+# --- Секреты push (Firebase Admin SDK) ---------------------------------------
+# Service account ключ FCM: приватный ключ внутри, поэтому вне репозитория.
+# Локально кладём в ./secrets/ (в dev он виден в контейнере через bind-mount).
+secrets/
+*.pem
+service-account*.json
+firebase-service-account*.json

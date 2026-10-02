@@ -10,30 +10,33 @@
 ```
 lost-dream-messenger/
 ├── config/                        # Django project
-│   ├── settings.py                # DB, MIDDLEWARE (+ LastSeenMiddleware), CACHES (Redis), REST_FRAMEWORK (+ троттлинг), SIMPLE_JWT, SPECTACULAR, CHANNEL_LAYERS, CORS
+│   ├── settings.py                # DB, MIDDLEWARE (+ LastSeenMiddleware), CACHES (Redis), REST_FRAMEWORK (+ троттлинг), SIMPLE_JWT, SPECTACULAR, CHANNEL_LAYERS, CORS, FCM (push), TEST_RUNNER
+│   ├── test_runner.py             # TestRunner: сливает сессии рабочих потоков перед удалением тестовой базы (только Postgres)
 │   ├── asgi.py                    # ASGI app: ProtocolTypeRouter (HTTP + WebSocket, AllowedHostsOriginValidator)
 │   ├── urls.py                    # admin/ + api/v1/ → messenger.urls
 │   └── wsgi.py                    # Fallback (в prod не используется, сервер — Daphne)
 ├── messenger/                     # Django app (единственное приложение)
-│   ├── models.py                  # User, Chat, Membership, Message + кастомный UserManager
+│   ├── models.py                  # User, Chat, Membership, Message, DeviceToken + кастомный UserManager
 │   ├── serializers.py             # DRF-сериалайзеры + Swagger-аннотации
-│   ├── views.py                   # ChatViewSet, RegisterView, LoginView/RefreshView/SchemaView, UserSearchView, MeView
+│   ├── views.py                   # ChatViewSet, RegisterView, LoginView/RefreshView/SchemaView, UserSearchView, MeView, DeviceViewSet, PushTestView
 │   ├── consumers.py               # ChatConsumer + NotificationConsumer (AsyncJsonWebsocketConsumer), message_payload(), publish_*
 │   ├── activity.py                # touch_last_seen() — обновление last_seen с троттлингом 60 с
 │   ├── middleware.py              # LastSeenMiddleware — активность на авторизованных REST-запросах
+│   ├── push.py                    # FCM-слой: инициализация firebase-admin, формат уведомления, presence-гейт, пул потоков
 │   ├── ratelimit.py               # RedisWindowLimiter (Lua INCR+PEXPIRE) + лимиты WS: сообщения, подключения, кап сессий
 │   ├── readstate.py               # unread_counts() / unread_counts_per_user() — непрочитанное по курсору Membership.last_read_at
 │   ├── ws_auth.py                 # JWT-аутентификация для WebSocket (token из query string)
 │   ├── routing.py                 # WebSocket URL patterns: ws/chat/<id>/ и ws/notifications/
-│   ├── admin.py                   # Django Admin с inlines (Membership, последние сообщения)
-│   ├── urls.py                    # DefaultRouter (chats) + auth/users/schema/docs
+│   ├── admin.py                   # Django Admin: свои формы пользователя (swap-нутая модель) + inlines (Membership, последние сообщения)
+│   ├── urls.py                    # DefaultRouter (chats, devices) + auth/users/schema/docs
 │   ├── migrations/
-│   └── tests.py                   # Пусто — тестов нет
+│   └── tests.py                   # 56 тестов: реестр устройств, presence-гейт, формат уведомления, разбор ответов FCM, пул потоков, сессии тестовой базы, UserManager
 ├── manage.py
 ├── requirements.txt               # Пины версий (prod + dev-инструменты, см. Tech Debt)
 ├── Dockerfile                     # Python 3.13-slim, multi-stage, непривилегированный appuser, Daphne
 ├── docker-compose.yml             # db (postgres:18) + redis:7 + backend + frontend (Vite dev)
-├── .env / .env.example            # DB_* читаются settings.py; DJANGO_SECRET_KEY/DEBUG — НЕ читаются
+├── .env / .env.example            # DB_* и PUSH_*/FIREBASE_* читаются settings.py; DJANGO_SECRET_KEY/DEBUG — НЕ читаются
+├── secrets/                       # (создаётся вручную) service account ключ Firebase — вне git и вне образа, см. «Push-уведомления»
 └── frontend/                      # Vue 3 SPA
     ├── src/
     │   ├── assets/styles.css      # Глобальные стили (CSS variables)
@@ -56,7 +59,8 @@ lost-dream-messenger/
 | Решение | Обоснование |
 |---------|-------------|
 | UUID PK во всех моделях | Безопасность (нет enumeration), совместимость с distributed |
-| `phone` как USERNAME_FIELD | Мессенджер-ориентированная идентификация; поле `username` из AbstractUser сохранено (у суперпользователя может быть пустой строкой, при регистрации через API в пустой `username` подставляется `phone`) |
+| `phone` как USERNAME_FIELD | Мессенджер-ориентированная идентификация; поле `username` из AbstractUser сохранено и пустым не бывает: его занимает `User.save()` — выводит телефон, когда значения нет, и тянет следом за номером, когда `username` всё ещё равен прежнему телефону (ручной ник не трогается). `UserManager.create_user` задаёт его явно, сериалайзер тут ни при: ModelForm (админка, фикстуры) идёт мимо менеджера, `username` unique и без дефолта, так что второй аккаунт с пустой строкой падал IntegrityError'ом |
+| Свой `UserCreationForm`/`UserChangeForm` в `admin.py`, а не штатные | Штатные привязаны к `django.contrib.auth.models.User` — в Django `Meta.model` задан конкретным классом, а у нас модель swap-нута. POST страницы «добавить» падал `Manager isn't available; 'auth.User' has been swapped for 'messenger.User'` (это `clean_username` дёргает `objects` мёртвой модели), и даже если бы прошёл: `add_fieldsets` спрашивает `username`, а `phone` — наш логин — не запрашивается вовсе, то есть аккаунт без входа. В форме изменения `phone` тоже отсутствовал, поэтому в админке нельзя было посмотреть или исправить логин |
 | Канонический телефон в `normalize_phone()` — только цифры | Телефон — логин, а `authenticate()` сравнивает строку точным совпадением: `+7 (999) 999-99-11`, `79999999911` и `7-999-…` — один аккаунт. Гарантию даёт `User.save()`, поэтому её не обходят ни админка, ни фикстуры; то же правило на входе и в поиске — иначе запрос с `+` не находит никого |
 | Ошибка входа не проходит через refresh-retry (`AUTH_URLS` в api.ts) | 401 от `/auth/login/` означает «неверные креды», а не «протух токен»: рефреш на нём заведомо отвечает 400, а его обработчик перезагружает страницу — то есть стирать текст ошибки и «выкидывать» с `/login` |
 | `/users/me/` для профиля | JWT payload содержит только `user_id` — профиль всегда догружается отдельным запросом |
@@ -82,14 +86,25 @@ lost-dream-messenger/
 | Уведомления — отдельный личный WS-канал `ws/notifications/`, а не «вечный» сокет чата | Сокет чата живёт, пока чат открыт: сообщение в другой чат доставлять не через что. Плюс у канала есть адресат для `chat_read`/`chat_deleted`, которых у чата нет (сокет закрыт), и общий на оба канала бюджет подключений |
 | Presence и `last_seen` переехали на личный канал | Иначе закрытие чата (Esc/крестик) анонсировало «offline», хотя пользователь ещё в приложении; сокет чата теперь только читает presence-хеш для `initial_presence` |
 | `user_status` анонсируется во все группы чатов пользователя | У presence-события нет «дома» — точку онлайн рисуют шапки личных чатов и список участников групповых, а чатов несколько; переход 0→1 и 1→0 редок, поэтому веер по N группам дешевле отдельной индексации |
+| Push — одна точка входа `publish_new_message()`, а не дубль в consumer'е и REST | Сообщение создаётся двумя путями, и требование «уведомить один раз» должно выполняться для обоих. Хук живёт там, где уже посчитан `unread_count` по получателям |
+| Push только offline-получателям (гейт по presence-хешу) | Живой личный канал = сообщение уже пришло по WS, и клиент сам рисует уведомление. Push поверх дал бы двойное уведомление на каждое сообщение. Компромисс: presence считает **соединения пользователя**, а не устройства — открытая веб-вкладка подавляет Android-push |
+| firebase-admin (HTTP v1), а не self-made HTTP-клиент | Протокол v1 требует OAuth2-подписи запросов и имеет свой формат ошибки; SDK отдаёт это `BatchResponse` по токенам. Legacy-server-key Google закрыл, поэтому «проще» оно только выглядит |
+| Отправка push — в `ThreadPoolExecutor`, из async-кода только `dispatch_message_push()` | `send_each_for_multicast` — синхронный HTTP на 100–300 мс; в Daphne-ивент-лоопе он затормозил бы рассылку всем WS-группам. Поток пула закрывает свои соединения сам: `connections.close_all()` в `finally` (не `close_old_connections()` — с `CONN_MAX_AGE = 60` она свежее соединение не трогает, и воркер держал бы сессию до конца жизни процесса) |
+| Пул потоков закрывается явно — `push.shutdown_executor()` | Потоки `ThreadPoolExecutor` не-демонские, и воркер держит своё соединение БД, пока жив поток: задание могло бы пережить тест и повлиять на следующий. На остановке процесса интерпретатор останавливает пул сам (проверено: процесс, успевший сходить в БД через пул, завершается без задержки), так что хук нужен детерминизму тестов (`tearDown` в `ChatFixtureMixin` и `ExecutorLifecycleTests`), а не shutdown'у контейнера |
+| Чужие сессии тестовой базы перед `DROP DATABASE` сливает `config.test_runner.TestRunner` | `connections` — thread-local реестр, и штатный runner закрывает соединения только своего потока: сессия общего потока asgiref (её открывает `database_sync_to_async` в счётчиках непрочитанного) переживает прогон, Postgres отказывает удалять базу — «database "test_db_messenger" is being accessed by other users» — и её осколок затем блокирует следующий прогон на создании. Runner перед удалением обходит чужие сессии через `pg_terminate_backend` (только Postgres, только база, отличная от рабочей). В проде те же соединения безвредны: их догоняет `close_old_connections()` по `CONN_MAX_AGE`, закрывать их в каждом обращении к БД — платить новым handshake |
+| Креденшел — из `FIREBASE_CREDENTIALS_JSON` (raw или base64), путь — запасной вариант | `credentials.Certificate(path)` отказывается читать файл с правами 644 (а в bind-mount'е `.:/app` права хозяйские), и ошибка выглядит как «ключ битый». ENV-значение проходит docker-secret'ами и не требует пересборки образа |
+| Push `ENABLED=0` по умолчанию, при отсутствии ключа — WARN/503, а не падение | `docker compose up` обязан подниматься без Firebase: рассылка — не единственная функция бэкенда, и `ImportError`/`RuntimeError` на старте положил бы весь API |
+| Мёртвый токен гасим по `UNREGISTERED`/`SENDER_ID_MISMATCH`, а `INVALID_ARGUMENT` — только если текст явно про токен | Тем же кодом FCM отвечает и на испорченный payload: гасить по нему = выключить уведомления на всех устройствах из-за одной ошибки в формате (вернули бы их только перерегистрацией клиента). `QuotaExceeded`/`Internal` не гасим никогда — там токен жив |
+| `token` в `DeviceToken` — unique, привязка к пользователю через `update_or_create` | FCM-токен идентифицирует пару (приложение, устройство), а не аккаунт: при входе другого пользователя на том же телефоне строка перепривязывается, иначе старый аккаунт продолжал бы получать чужие уведомления, а с `unique_together(user, token)` на устройстве копились бы дубликаты |
 
 ## 📦 Модели данных
 
-- **User** (`AbstractUser` + UUID PK): `phone` (unique, USERNAME_FIELD), `email`/`first_name`/`last_name` (опциональные), `last_seen` (обновляется при подключении и отключении личного WS-канала `ws/notifications/`, при отправке сообщения в WS и на любом авторизованном REST-запросе — с троттлингом 60 с). Телефон хранится канонически — только цифры, без `+` и разделителей; гарантирует это `User.save()` через `normalize_phone()`, поэтому правило действует и в админке, и в shell. `username` при регистрации повторяет телефон.
+- **User** (`AbstractUser` + UUID PK): `phone` (unique, USERNAME_FIELD), `email`/`first_name`/`last_name` (опциональные), `last_seen` (обновляется при подключении и отключении личного WS-канала `ws/notifications/`, при отправке сообщения в WS и на любом авторизованном REST-запросе — с троттлингом 60 с). Телефон хранится канонически — только цифры, без `+` и разделителей; гарантирует это `User.save()` через `normalize_phone()`, поэтому правило действует и в админке, и в shell. `username` (уникальное поле `AbstractUser`) повторяет канонический телефон: пустое значение выводит `User.save()` — этого хватает и админке, и shell, и фикстурам, куда `create_user` не доходит; `UserManager` задаёт его явно, а `from_db()` снимает в `_loaded_phone` загруженный номер, чтобы при смене телефона `username` уехал следом, только если равен прежнему номеру (ник, выбранный вручную, не перезаписывается).
 - **Chat**: `type` (PRIVATE/GROUP), `name` (для групп), `members` M2M через Membership, ordering `-created_at`.
 - **Membership**: user ↔ chat, `is_admin`, `last_read_at` (курсор прочтения, см. ниже), unique constraint `unique_user_chat` (продублирован legacy `unique_together`).
 - **Message**: `chat` FK, `sender` FK, `text` (≤5000), `created_at`, `is_read` (глобальный флаг на сообщение, не per-user), index `(chat, created_at)`, ordering `created_at`.
 - **Курсор прочтения** (`Membership.last_read_at`, `default=timezone.now`): непрочитанными считаются сообщения чата, созданные позже этой отметки и не от самого пользователя. Считает единственная функция `messenger/readstate.py::unread_counts(user, chat_ids)` — один запрос на весь список чатов (`Count(..., filter=Q(created_at__gt=F("last_read_at")) & ~Q(sender=user))`, условие ложится на индекс `(chat, created_at)`). `default`, а не `null=True`: миграция заполняет старые строки «сейчас», поэтому после выгрузки курса сайдбар не вспыхнет всеми архивными сообщениями, а новый участник группы стартует «прочитано». `Message.is_read` курсор не заменяет — по-прежнему глобальный флаг, галочку ✓✓ не трогает.
+- **DeviceToken**: `user` FK (`related_name="device_tokens"`), `token` (unique, max 512 — FCM-токен ~150 символов, с запасом на будущее API), `platform` (android/ios/other, дефолт android), `is_active`, `app_version`, `created_at`/`last_seen_at` (`auto_now` — по нему видно, что устройство живо), UUID PK, index `(user, is_active)`, ordering `-last_seen_at`. `is_active` — мягкое выключение: гасим после `UNREGISTERED` из FCM, не удаляя историю (жёсткий `DELETE` лишил бы нас же этого сигнала). Значение токена наружу не отдаётся никогда (в админке — только префикс 16 символов, поле readonly).
 
 ## 🔌 REST API (префикс `/api/v1/`)
 
@@ -112,6 +127,11 @@ lost-dream-messenger/
 | GET | `/users/me/` | Профиль текущего пользователя (по JWT) |
 | PATCH | `/users/me/` | Редактирование своего профиля: `phone`, `email`, `first_name`, `last_name` — все опциональны, непереданные поля остаются как есть; ответ — формат `GET /users/me/`. Телефон нормализуется как при регистрации и проверяется на уникальность с `exclude(pk=...)`; если `username` совпадал со старым телефоном, он меняется следом за ним (иначе новый владелец номера упрётся в unique `username` при регистрации). Смена телефона не затрагивает действующий JWT — в payload только `user_id` |
 | GET | `/users/search/?q=` | Поиск по телефону/first_name/last_name, исключает себя, лимит 20. По телефону ищет подстрокой от цифр запроса (`normalize_phone`), поэтому `+7 999 …` находит аккаунт `7999…`; запрос без цифр идёт только по имени |
+| GET | `/devices/` | Мои устройства push: `id`, `platform`, `app_version`, `is_active`, `last_seen_at`. **Значения токена в ответе нет** |
+| POST | `/devices/` | Регистрация (upsert) FCM-токена: `{token, platform?, app_version?}` → 200 всегда, тело — как `GET` + `created`. Идемпотентен, поэтому клиент может слать его на каждом старте. `token` валидируется регуляркой (FCM-токен — ~150 символов `[A-Za-z0-9_.:=\-]`), значения вне алфавита → 400. Если токен уже закреплён за другим аккаунтом, строка **перепривязывается** к текущему и реактивируется |
+| DELETE | `/devices/{id}/` | Забыть устройство по uuid; чужой uuid → 404 (queryset отфильтрован по `user`) |
+| POST | `/devices/revoke/` | `{token}` → 204. Для logout, когда uuid устройства клиент не помнит: удаляет только его собственную строку, чужой токен — тоже 204 (иначе маршрут служил бы оракулом «есть такой токен у кого-то?»). Идемпотентен |
+| POST | `/notifications/test/` | Тестовый push на **свои** активные android-устройства: `{title?, body?}` → 200 с отчётом `{sent, failed, deactivated, recipients}` (FCM вызывается синхронно, чтобы диагностика была честной). Push выключен/не настроен → 503, сбой FCM → 502, нет устройств → `{"reason": "no_tokens"}` |
 | GET | `/docs/` | Swagger UI |
 | GET | `/schema/` | OpenAPI 3.0 schema |
 
@@ -137,6 +157,8 @@ lost-dream-messenger/
 | `read` | 120/min | `ChatViewSet.ACTION_THROTTLE_SCOPES["mark_read"]` — отметка прочтения вызывается при каждом открытии/фокусе вкладки | user id |
 | `write` | 30/min | `create`, `create_private`, `add_member`, `remove_member`, `destroy`, `partial_update` | user id |
 | `search` | 20/min | `UserSearchView` | user id |
+| `devices` | 30/min | `DeviceViewSet.ACTION_THROTTLE_SCOPES` на `create`/`revoke` | user id |
+| `push_test` | 5/min | `PushTestView.throttle_scope` — каждый запрос реально уходит в FCM | user id |
 | `profile` | 20/min | `MeView.get_throttles()` — только на `PATCH` (ошибка unique-валидации отвечает «занято ли», то есть это enumeration), GET остаётся на глобальном `user` | user id |
 | `schema` | 30/hour | `SchemaView` | IP |
 
@@ -148,7 +170,7 @@ lost-dream-messenger/
 
 `LoginView`/`RefreshView`/`SchemaView` в `views.py` — сабклассы `TokenObtainPairView`/`TokenRefreshView`/`SpectacularAPIView`, нужны чтобы задать `throttle_scope`, а `LoginView` ещё и `serializer_class = LoginSerializer` (нормализация телефона перед `authenticate()`; SimpleJWT ищет пользователя точным совпадением, а телефон в БД хранится «чистым»).
 
-`normalize_phone()` в `models.py` — единственная реализация правила «в телефоне только цифры»: она вырезает `+`, пробелы, скобки и дефисы. Каноничность на записи даёт `User.save()` (вызывает её же и для `create_user`, и для админки, и для фикстур), на чтении — `LoginSerializer` (иначе SimpleJWT искал бы строку точным совпадением и вход с разделителями давал бы 401), `RegisterSerializer.validate_phone` (из телефона дефолтом заполняется unique `username`) и `ProfileUpdateSerializer.validate_phone`. `UserSearchView` нормализует цифры запроса — поиск `+7 999 …` иначе не нашёл бы никого.
+`normalize_phone()` в `models.py` — единственная реализация правила «в телефоне только цифры»: она вырезает `+`, пробелы, скобки и дефисы. Каноничность на записи даёт `User.save()` (вызывает её же и для `create_user`, и для админки, и для фикстур), на чтении — `LoginSerializer` (иначе SimpleJWT искал бы строку точным совпадением и вход с разделителями давал бы 401), `RegisterSerializer.validate_phone` (пустой `username` менеджер заполнит уже нормализованным телефоном) и `ProfileUpdateSerializer.validate_phone`. `UserSearchView` нормализует цифры запроса — поиск `+7 999 …` иначе не нашёл бы никого.
 
 Нормализация склеивает форматы одного номера, но не разные номера: `+7999…` и `7999…` — один аккаунт, а `8999…` — другой (замену ведущего `8` на `7` не делаем). Наружу телефон отдаётся как лежит, то есть без `+`.
 
@@ -231,6 +253,42 @@ Daphne дополнительно ограничивает размер кадр
 
 Фронт не reconnect'ится ни на один из этих кодов — при лимитах переподключение только продлевает бан (счётчик пополняется каждым новым handshake).
 
+## 📲 Push-уведомления (Android / FCM)
+
+Серверная часть: реестр устройств (`DeviceToken`) + рассылка «новое сообщение» в Firebase Cloud Messaging (HTTP v1, `firebase-admin`). Сами уведомления рисует Android-клиент — локальные, запланированные и показанные из WS; сервер к планированию не привлекается.
+
+**Поток:** `publish_new_message()` → `recipient_unread()` (счётчики) → `online_user_ids()` (presence-хеш) → `group_send` в личные каналы → `dispatch_message_push(message_id, counts, online)` → `schedule_job(send_message_push, …)` в `ThreadPoolExecutor` → `_send_multicast()` → `messaging.send_each_for_multicast`.
+
+| Шаг | Что важно |
+|-----|-----------|
+| Отбор получателей | Только `unread_by_uid` минус `online_uids` (presence-счётчик > 0). Нормализация ключей к `str`: из Redis приходят строки, `unread_by_uid` тоже keyed по str, но UUID-vs-str на этом пути уже ронял гейт |
+| Пустой результат | `skipped_reason`: `disabled` (рубильник), `all_online`, иначе `None` — возвращает `dispatch_message_push`, чтобы логи и тесты видели, почему молчим |
+| Формат | Гибрид `notification` + `data`: при убитом процессе уведомление показывает SDK (Dart-код не проснётся), при живом клиент читает `data` и решает сам. Все значения `data` — строки, HTTP v1 не-строки отвергает |
+| Канал | `PRIVATE` → `CHANNEL_HIGH` (title = имя отправителя), `GROUP` → `CHANNEL_LOW` (title = «Название чата · Имя отправителя», безымянная группа → «Групповой чат»). В `body` — превью текста (схлопнут, обрезан до 180) + `· ещё N`, если непрочитанных больше одного |
+| Дедупликация на клиенте | `tag = str(message.id)` — повторная отправка того же сообщения перезаписывает уведомление, а не кладёт второе |
+| TTL | `PUSH_TTL_SECONDS` (4 ч по умолчанию): просроченное уведомление — шум, непрочитанное дотянется через REST при следующем открытии |
+| Ошибки | Разбор `BatchResponse` по токенам: мёртвый → `is_active=False`, временный (квота/5xx) → токен сохраняется; сбой всей отправки → WARN, job не падает; исключение из диспетчера перехвачено в `publish_new_message` — push не может сломать WS-доставку |
+
+**Конфигурация (`settings.FCM`, всё из env; значения — в `.env.example`):**
+
+| ENV | Дефолт | Назначение |
+|-----|--------|-----------|
+| `PUSH_ENABLED` | `0` | Рубильник. При `0` диспетчер не планирует ничего, `/notifications/test/` отвечает 503 |
+| `FIREBASE_PROJECT_ID` | — | Только для `options["projectId"]` и логов; берётся из ключа |
+| `FIREBASE_CREDENTIALS_JSON` | — | JSON service account ключа (raw или base64) — **предпочтительный** способ |
+| `FIREBASE_CREDENTIALS_PATH` | — | Путь к файлу; в compose указывает на `/app/secrets/firebase-service-account.json` |
+| `PUSH_CHANNEL_HIGH` / `PUSH_CHANNEL_LOW` | `mdm_messages_high` / `mdm_messages_low` | id Android-каналов, должны совпадать с создаваемыми клиентом |
+| `PUSH_ICON` / `PUSH_COLOR` | `ic_notification` / `#4F46E5` | Монохромная иконка в статус-баре и акцентный цвет |
+| `PUSH_TTL_SECONDS` | `14400` | Время жизни уведомления на стороне FCM |
+
+**Как включить:**
+1. Firebase Console → новый проект (или существующий) → добавить Android-приложение с `applicationId` клиента → скачать `google-services.json` в клиента.
+2. Project settings → Service accounts → **Generate new private key** → положить JSON в `secrets/firebase-service-account.json` (каталог в `.gitignore` и `.dockerignore`; в dev виден в контейнере через bind-mount `.:/app`, отдельного mount не нужен).
+3. `.env`: `PUSH_ENABLED=1` + `FIREBASE_PROJECT_ID=…` (или `FIREBASE_CREDENTIALS_JSON=…`, если ключ прокидывается значением).
+4. `docker compose up -d --build backend` (нужна миграция `0005_device_token`).
+
+**Как проверить без клиента:** `POST /api/v1/devices/ {token}` с настоящим FCM-токеном устройства (берётся из логов клиента) → `POST /api/v1/notifications/test/ {title, body}`. Ответ содержит `sent/failed/deactivated`; `502` означает, что FCM отверг запрос (формат/креденшел), `503` — push выключен или ключ не прочитан.
+
 ## 🖥 Frontend (Vue 3 SPA)
 
 - **auth.ts (Pinia)**: `UserProfile` (формат `/users/me/`) и `ProfileUpdatePayload` типизированы и экспортируются; login/register сохраняют токены в localStorage и грузят профиль через `/users/me/`; `getUserFromToken()` при перезагрузке восстанавливает из JWT только `id` (payload не содержит имени/телефона), полный профиль догружает `App.vue` в `onMounted`. `updateProfile(payload)` — `PATCH /users/me/`, при успехе заменяет `user` ответом сервера и возвращает true, при ошибке собирает текст (`detail`, иначе первое поле из DRF-овских `{field: ["..."]}`) в `error` и возвращает false. Logout — только очистка localStorage.
@@ -253,7 +311,7 @@ Daphne дополнительно ограничивает размер кадр
 - **Dockerfile (backend)**: python:3.13-slim, multi-stage (pip `--prefix=/install`), непривилегированный `appuser`.
 - **Dockerfile (frontend)**: node:22-alpine, `npm ci`; target `dev` — Vite с `--host 0.0.0.0`; target `prod` — билд + nginx с `nginx.conf` (upstream `backend:8000`).
 - **nginx.conf (prod)**: `limit_req` на `/api/` (30 r/s на IP, burst 60 nodelay) и `limit_conn 10` на `/ws/`; обе зоны — `$binary_remote_addr`, ответы 429. Работает только на prod-таргете, в compose поднят `dev`.
-- **`.dockerignore`** (корневой, для образа backend): исключает `.git`, `.env*`, `.venv/`, кэши (`.ruff_cache/`, `.pytest_cache/`, `.mypy_cache/`), `frontend/` (у фронтенда собственный build-контекст `./frontend`), `node_modules/`, `media/`, `staticfiles/`.
+- **`.dockerignore`** (корневой, для образа backend): исключает `.git`, `.env*`, `secrets/` (Firebase-ключ — см. «Push-уведомления»), `.venv/`, кэши (`.ruff_cache/`, `.pytest_cache/`, `.mypy_cache/`), `frontend/` (у фронтенда собственный build-контекст `./frontend`), `node_modules/`, `media/`, `staticfiles/`.
 - Статика: WhiteNoise (`CompressedManifestStaticFilesStorage`), `collectstatic` выполняется в команде compose.
 - Swagger UI + drf-spectacular с JWT security scheme и persistAuthorization.
 
@@ -278,10 +336,37 @@ cd frontend && npm run build                # type-check + vite build
 
 # Линт бэкенда (ruff установлен в requirements)
 ruff check .
+ruff format .
+
+# Тесты бэкенда (Django TestCase, без pytest)
+docker compose exec backend python manage.py test
+docker compose exec backend python manage.py test messenger.tests.PushPayloadTests -v 2
 
 # Полный сброс БД
 docker compose down -v && docker compose up --build -d
 ```
+
+**Тесты без Docker** (Postgres/Redis недоступны). Основной прогон — в контейнере; если подняться нечем, помогает overlay-модуль настроек вне репозитория (он не нужен в git — это обходной путь для локального прогона, а не конфигурация приложения):
+
+```python
+# /tmp/push_test_settings.py
+from config.settings import *  # noqa
+
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME": "/tmp/push_tests.sqlite3",
+    }
+}
+CACHES = {"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}}
+CHANNEL_LAYERS = {"default": {"BACKEND": "channels.layers.InMemoryChannelLayer"}}
+```
+
+```bash
+PYTHONPATH=/tmp:. DJANGO_SETTINGS_MODULE=push_test_settings python manage.py test
+```
+
+Три ограничения такого прогона, все нужно знать: `TransactionTestCase` обязателен тестам, которые лезут в БД из `database_sync_to_async` (другой поток — другое соединение; на TestCase там либо пустой результат, либо `database table is locked`), `create_private` на sqlite не проверить — `select_for_update` там падает, и `ForeignSessionCleanupTests` (слив сессий тестовой базы) читает `pg_stat_activity`, поэтому на sqlite пропускается — прогон обязан финишировать с `OK (skipped=1)`.
 
 ## 🚧 В планах (приоритет по убыванию)
 
@@ -298,10 +383,12 @@ docker compose down -v && docker compose up --build -d
 - [ ] Typing indicators («печатает...»)
 - [ ] Загрузка файлов и изображений (MEDIA_* в settings заданы, но media не раздаётся)
 - [ ] Message editing / deletion
-- [ ] Push notifications
+- [x] Push notifications — серверная часть: `DeviceToken` + `/devices/`, рассылка из `publish_new_message` с presence-гейтом, формат `notification`+`data`, `/notifications/test/` для диагностики (см. «Push-уведомления»)
+- [ ] Push на клиенте (Flutter: `NotificationService`, Android-каналы с теми же id, разрешения 13+/14+, навигация по тапу) + веб-пуш при закрытой вкладке
 
 ### Phase 3: Quality & Ops
-- [ ] pytest + factory_boy + coverage > 80% (tests.py сейчас пустой)
+- [x] Тесты бэкенда: 56 тестов в `messenger/tests.py` на `django.test.TestCase` (без pytest: Channels + async-фикстуры на нём пишутся прямо, factory_boy добавил бы ещё одну зависимость ради четырёх моделей). Покрыты контракт `/devices/`, presence-гейт, формат уведомления, разбор ответов FCM, жизненный цикл пула потоков, слив сессий тестовой базы и `UserManager` (заполнение unique `username`); Firebase не вызывается — шов `_send_multicast`
+- [ ] Покрытие > 80% (тестами закрыт только push-слой; views/consumers по-прежнему без проверок), `pytest-django` — только если понадобится параметризация
 - [ ] Vitest для frontend unit-тестов
 - [ ] ESLint/Prettier + pre-commit hooks (ruff для backend уже есть)
 - [ ] CI/CD (GitHub Actions)
@@ -317,9 +404,12 @@ docker compose down -v && docker compose up --build -d
 
 1. **SECRET_KEY и DEBUG захардкожены** в `settings.py`; `DJANGO_SECRET_KEY`/`DJANGO_DEBUG` из `.env.example` **не читаются** — перед деплоем перевести на env.
 2. **Rate limiting не покрывает `/admin/`** — DRF-троттлинг работает только на DRF-view'ах, Django Admin не ограничен ничем; WS-лимитеры в `ChatConsumer` есть, но nginx-слой с `limit_req`/`limit_conn` исполняется только на prod-таргете фронтенда (в compose поднят `dev`).
-3. **Нет тестов** — покрытие 0% (backend + frontend).
+3. **Покрытие тестами — только push-слой и менеджер пользователей** (56 тестов в `messenger/tests.py`); views, consumers и формат WS-событий по-прежнему не проверяются, фронтенд — тоже.
 4. **`is_read` глобальный на сообщение** — в групповом чате прочтение одним участником помечает сообщение прочитанным для всех. Частично закрыто: бейдж непрочитанного считается по per-user курсору `Membership.last_read_at`, но галочка ✓✓ по-прежнему опирается на глобальный флаг — read-receipt на пару (сообщение, пользователь) не заводили.
 5. **Валидация пароля отключена** — `validate_password` и `min_length` в RegisterSerializer закомментированы; `AUTH_PASSWORD_VALIDATORS` в DRF не применяются автоматически.
 6. **requirements.txt**: gunicorn не используется (сервер — Daphne), ruff — dev-инструмент в prod-образе.
 7. **Concurrent 401** — interceptor в api.ts не блокирует параллельные refresh-запросы (ротация refresh-токенов не включена, поэтому не критично).
 8. **`create_private` полагается на `select_for_update`** — защита от дубликатов работает только на Postgres; на SQLite (например, в будущих тестах) запрос упадёт с `NotSupportedError`.
+9. **Presence-гейт считает соединения пользователя, а не устройства** — `messenger:presence` общий для веба и Android, поэтому открытая веб-вкладка подавляет push на телефоне (и наоборот: телефон с живым каналом = уведомления в вебе не дублируются push'ем). Это осознанный компромисс вместо двойной доставки; если различать платформы — нужен presence-ключ вида `{user_id}:{platform}`.
+10. **iOS-токены принимаются, но не используются** — `_active_tokens_by_user` фильтрует по `platform=android`: APNs-ключей в проекте нет, а отправка iOS-токена с `AndroidConfig` давала бы ошибку на каждое устройство. Для iOS нужен отдельный `ApnsConfig` и отдельный гейт.
+11. **Серверного планирования напоминаний нет** — запланированные (в т.ч. ежедневные) уведомления живут только на клиенте через `zonedSchedule`; переживание перезагрузки устройства — заслуга `RECEIVE_BOOT_COMPLETED` + receiver'ов плагина, а не бэкенда.

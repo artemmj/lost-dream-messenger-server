@@ -1,3 +1,5 @@
+import logging
+
 import redis.asyncio as aioredis
 from asgiref.sync import async_to_sync
 from channels.db import database_sync_to_async
@@ -10,6 +12,7 @@ from django.utils import timezone
 
 from .activity import touch_last_seen
 from .models import Membership, Message
+from .push import dispatch_message_push
 from .ratelimit import (
     CONNECT_LIMITER,
     MAX_CONNECTIONS_PER_USER,
@@ -19,6 +22,8 @@ from .readstate import unread_counts_per_user
 from .ws_auth import get_user_from_scope
 
 User = get_user_model()
+
+logger = logging.getLogger(__name__)
 
 PRESENCE_KEY = "messenger:presence"
 
@@ -34,6 +39,31 @@ def get_redis() -> aioredis.Redis:
             decode_responses=True,
         )
     return _redis_client
+
+
+def _connection_count(value) -> int:
+    """Presence-значение как число: мусор в хеше не должен ронять рассылку."""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+async def online_user_ids() -> set:
+    """
+    Пользователи с активным личным каналом — тем push не нужен.
+
+    Тот же presence-хеш, что даёт `initial_presence` и cap соединений, поэтому
+    отдельного учёта не заводим. Сбой Redis отдаёт пустой набор сознательно:
+    «никто не онлайн» означает доставить push всем (клиент отфильтрует дубликат по
+    id сообщения), а «все онлайн» означало бы молчание у всех.
+    """
+    try:
+        presence = await get_redis().hgetall(PRESENCE_KEY)
+    except Exception as error:  # noqa: BLE001 - граница с внешним сервисом
+        logger.warning("Presence недоступен, push уйдёт всем: %s", error)
+        return set()
+    return {uid for uid, count in presence.items() if _connection_count(count) > 0}
 
 
 def message_payload(msg: Message) -> dict:
@@ -398,10 +428,17 @@ async def publish_new_message(message: Message) -> None:
     """
     Уведомление о новом сообщении — каждому получателю в его личную группу.
     Счётчик непрочитанного серверный: клиенту не нужно хранить свой курсор.
+
+    Здесь же подключается push: тем, до кого живой канал не дотянулся. Порядок
+    «presence → group_send → push» выбран нарочно: если участник отключится, пока
+    мы рассылаем, он получит и ws-кадр в уже мёртвый сокет, и push. Дубликат
+    дешевле, чем молчание, а клиент дедуплицирует по id сообщения.
     """
     layer = get_channel_layer()
     payload = message_payload(message)
     counts = await recipient_unread(message)
+    online = await online_user_ids()
+
     for uid, unread in counts.items():
         await layer.group_send(
             f"user_{uid}",
@@ -412,6 +449,11 @@ async def publish_new_message(message: Message) -> None:
                 "unread_count": unread,
             },
         )
+
+    try:
+        await dispatch_message_push(str(message.id), counts, online)
+    except Exception as error:  # noqa: BLE001 - push не должен ломать ws-рассылку
+        logger.warning("Push-диспетчер не отработал: %s", error)
 
 
 @database_sync_to_async

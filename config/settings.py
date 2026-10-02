@@ -79,6 +79,11 @@ DATABASES = {
     }
 }
 
+# Runner сливает висящие сессии тестовой базы перед её удалением: их держат
+# рабочие потоки (asgiref, push-пул), а Django закрывает только своё — иначе
+# `manage.py test` падает на «is being accessed by other users».
+TEST_RUNNER = "config.test_runner.TestRunner"
+
 AUTH_PASSWORD_VALIDATORS = [
     {
         "NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator",
@@ -148,6 +153,12 @@ REST_FRAMEWORK = {
         # PATCH /users/me/: уникальные поля, ошибка валидации = enumeration
         "profile": "20/min",
         "schema": "30/hour",
+        # Регистрация push-токена — событие редкое (вход, ротация токена). 30/мин
+        # с запасом, но закрывает и спам, и перебор uuid на DELETE /devices/<id>/.
+        "devices": "30/min",
+        # Тестовый push: сам ход дорогой (обращение к FCM), а не диагностический
+        # запрос на каждый чих.
+        "push_test": "5/min",
     },
     # Один прокси (nginx): без этого DRF берёт весь X-Forwarded-For целиком,
     # а он подделывается заголовком запроса.
@@ -202,6 +213,39 @@ CHANNEL_LAYERS = {
             "expiry": 10,
         },
     },
+}
+
+# Push-уведомления через Firebase Cloud Messaging (HTTP v1).
+#
+# ENABLED=0 по умолчанию: локальный `docker compose up` поднимается без ключей,
+# push просто не отправляется (с одной WARN в лог). Без этого бэкенд требовал бы
+# Firebase-проекта для запуска, а это лишний блок для любой правки вне push.
+#
+# Креденшел админ-SDK — service account key из Firebase Console:
+#   FIREBASE_CREDENTIALS_JSON — сам JSON или base64 от него (для compose:
+#     значение можно положить в .env, файл в контейнер не монтируется);
+#   FIREBASE_CREDENTIALS_PATH — путь к файлу (вариант для прода с mounted secret).
+# JSON-вариант предпочтительнее: `credentials.Certificate(путь)` отказывается
+# читать файл с правами лучше 600 («readable by the public»), а в контейнере это
+# почти всегда 644.
+#
+# CHANNEL_HIGH/CHANNEL_LOW — те же id, что обязан создать клиент своими
+# Android-каналами (flutter_local_notifications). Расхождение — и системное
+# уведомление, показанное самим SDK при убитом приложении, попадёт в канал-заглушку
+# «прочие» без нужного звука и приоритета.
+FCM = {
+    "ENABLED": os.environ.get("PUSH_ENABLED", "0") == "1",
+    "PROJECT_ID": os.environ.get("FIREBASE_PROJECT_ID", ""),
+    "CREDENTIALS_JSON": os.environ.get("FIREBASE_CREDENTIALS_JSON", ""),
+    "CREDENTIALS_PATH": os.environ.get("FIREBASE_CREDENTIALS_PATH", ""),
+    "CHANNEL_HIGH": os.environ.get("PUSH_CHANNEL_HIGH", "mdm_messages_high"),
+    "CHANNEL_LOW": os.environ.get("PUSH_CHANNEL_LOW", "mdm_messages_low"),
+    # Иконка в статус-баре: монохромный drawable из android/app/src/main/res/drawable
+    "ICON": os.environ.get("PUSH_ICON", "ic_notification"),
+    "COLOR": os.environ.get("PUSH_COLOR", "#4F46E5"),
+    # «Просроченное» уведомление о сообщении, прилетевшее через сутки, — шум:
+    # непрочитанное и так дотянется через REST при следующем открытии.
+    "TTL_SECONDS": int(os.environ.get("PUSH_TTL_SECONDS", "14400")),
 }
 
 CORS_ALLOWED_ORIGINS = [

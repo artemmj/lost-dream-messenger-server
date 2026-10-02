@@ -18,3 +18,5 @@ docker-compose.yml
 *.sqlite3
 media/
 staticfiles/
+# Service account ключ FCM: в образ не попадает, в dev виден через bind-mount .:/app
+secrets/

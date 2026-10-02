@@ -17,7 +17,8 @@ def normalize_phone(value: str) -> str:
 class UserManager(BaseUserManager):
     """
     Кастомный менеджер пользователей.
-    Убирает обязательность email для create_user и create_superuser.
+    Убирает обязательность email для create_user и create_superuser и заполняет
+    `username` телефоном, когда его не передали.
     Телефон используется как основной идентификатор (USERNAME_FIELD).
     """
 
@@ -31,6 +32,15 @@ class UserManager(BaseUserManager):
             raise ValueError("Телефон обязателен")
 
         # Канонический вид телефону задаёт User.save()
+
+        # `username` у AbstractUser unique и без значения по умолчанию: без
+        # заполнения здесь оставалась пустая строка, и второй аккаунт падал
+        # IntegrityError'ом. Регистрация через API это обходила (телефон
+        # подставлял сериалайзер), админка, shell и фикстуры — нет.
+        # Форма та же, что у телефона: `User.save()` канонит его, а «+7 (999) …»
+        # в `username` не совпал бы с логином.
+        username = (extra_fields.pop("username", "") or "").strip()
+        extra_fields["username"] = username or normalize_phone(str(phone))
 
         # email может быть None или пустой строкой — нормализуем
         email = extra_fields.pop("email", None)
@@ -87,12 +97,31 @@ class User(AbstractUser):
         verbose_name = "Пользователь"
         verbose_name_plural = "Пользователи"
 
+    @classmethod
+    def from_db(cls, db, field_names, values):
+        instance = super().from_db(db, field_names, values)
+        # Снимка телефона на момент загрузки — по ней `save()` понимает, что
+        # `username` не задавали вручную, а вывели из прежнего номера.
+        if "phone" in field_names:
+            instance._loaded_phone = instance.phone
+        return instance
+
     def save(self, *args, **kwargs):
         # Нормализуем на сохранении, а не только в менеджере: телефон — логин, и
         # канонический вид должен обеспечиваться и для админки, и для shell, и для
         # фикстур, иначе вход перестанет находить аккаунт.
         self.phone = normalize_phone(self.phone)
+        # `username` — здесь по той же причине: `ModelForm` (админка) и `loaddata`
+        # идут мимо `create_user`, а поле unique и без дефолта, так что второй
+        # аккаунт с пустой строкой упал бы IntegrityError'ом. Смена номера тянет за
+        # собой `username` только пока он равен прежнему телефону (то есть выведен,
+        # а не выбран вручную) — иначе новый владелец номера упрётся в unique при
+        # регистрации. Менеджер оставляем: он задаёт значение явно.
+        loaded = getattr(self, "_loaded_phone", None)
+        if not self.username or self.username == loaded:
+            self.username = self.phone
         super().save(*args, **kwargs)
+        self._loaded_phone = self.phone
 
     def __str__(self):
         return self.first_name or self.phone
@@ -149,6 +178,63 @@ class Membership(models.Model):
 
     def __str__(self):
         return f"{self.user.username} in {self.chat.id}"
+
+
+class DeviceToken(models.Model):
+    """
+    Push-токен устройства пользователя (FCM registration token).
+
+    `token` unique, а не `(user, token)`: токен привязан к паре (приложение,
+    устройство), поэтому при выходе из аккаунта A и входе в B на том же телефоне
+    строку нужно ПЕРЕПРИВЯЗАТЬ к новому владельцу, а не плодить дубликат, который
+    затем заставит сервер слать одному устройству два одинаковых push.
+
+    `is_active` — мягкое выключение: FCM отвечает `Unregistered` или
+    `SenderIdMismatch` на протухший токен, и такие токены нужно перестать дёргать,
+    не теряя историю (кто где терял уведомления).
+    """
+
+    class Platform(models.TextChoices):
+        ANDROID = "android", "Android"
+        IOS = "ios", "iOS"
+        OTHER = "other", "Прочее"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="device_tokens",
+    )
+    token = models.CharField(
+        max_length=512,
+        unique=True,
+        verbose_name="Токен устройства",
+    )
+    platform = models.CharField(
+        max_length=10,
+        choices=Platform.choices,
+        default=Platform.ANDROID,
+        verbose_name="Платформа",
+    )
+    is_active = models.BooleanField(default=True, verbose_name="Активен")
+    app_version = models.CharField(max_length=32, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    last_seen_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Токен устройства"
+        verbose_name_plural = "Токены устройств"
+        ordering = ["-last_seen_at"]
+        indexes = [
+            # Основной запрос на рассылке: «активные токены этих пользователей»
+            # (фильтр по user + is_active). Поиск по самому токену обслуживает
+            # unique-индекс, его сюда не дублируем.
+            models.Index(fields=["user", "is_active"]),
+        ]
+
+    def __str__(self):
+        flags = "" if self.is_active else " (неактивен)"
+        return f"{self.platform} {str(self.token)[:12]}… для {self.user}{flags}"
 
 
 class Message(models.Model):

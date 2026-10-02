@@ -39,6 +39,11 @@ services:
       - "8000:8000"
     environment:
       - DJANGO_SETTINGS_MODULE=config.settings
+      # Ключ service account лежит в ./secrets/ (вне git и вне образа — см.
+      # .dockerignore) и виден в контейнере через mount `.:/app`. PUSH_ENABLED,
+      # FIREBASE_PROJECT_ID и — для тех, кому удобнее env вместо файла —
+      # FIREBASE_CREDENTIALS_JSON приходят из .env.
+      - FIREBASE_CREDENTIALS_PATH=/app/secrets/firebase-service-account.json
     depends_on:
       db:
         condition: service_healthy

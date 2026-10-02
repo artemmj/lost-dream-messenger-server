@@ -10,6 +10,7 @@ from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_sche
 from drf_spectacular.views import SpectacularAPIView
 from rest_framework import generics, permissions, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.mixins import CreateModelMixin, DestroyModelMixin, ListModelMixin
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -17,7 +18,8 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
 from .consumers import message_payload, publish_new_message, publish_to_users
-from .models import Chat, Membership, Message, normalize_phone
+from .models import Chat, DeviceToken, Membership, Message, normalize_phone
+from .push import PushNotConfigured, push_enabled, send_test_push
 from .readstate import unread_counts
 from .serializers import (
     AddMemberSerializer,
@@ -25,6 +27,9 @@ from .serializers import (
     ChatDetailSerializer,
     ChatListSerializer,
     ChatRenameSerializer,
+    DeviceRevokeSerializer,
+    DeviceTokenCreateSerializer,
+    DeviceTokenSerializer,
     LoginSerializer,
     MeSerializer,
     MessageCreateSerializer,
@@ -34,6 +39,7 @@ from .serializers import (
     RegisterResponseSerializer,
     RegisterSerializer,
     RemoveMemberSerializer,
+    TestPushSerializer,
     UserSerializer,
 )
 
@@ -631,6 +637,7 @@ class UserSearchView(generics.ListAPIView):
         qs = User.objects.filter(conditions).exclude(id=self.request.user.id)
         return qs[:20]  # Максимум 20 результатов
 
+
 class MeView(APIView):
     """
     GET   /users/me/ — профиль текущего аутентифицированного пользователя.
@@ -671,3 +678,192 @@ class MeView(APIView):
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
         return Response(MeSerializer(user).data)
+
+
+class DeviceViewSet(
+    CreateModelMixin,
+    ListModelMixin,
+    DestroyModelMixin,
+    viewsets.GenericViewSet,
+):
+    """
+    Push-токены устройств текущего пользователя.
+
+    - create: upsert токена (`POST /devices/`) — идемпотентен, можно слать на
+      каждый вход и на каждую ротацию токена;
+    - list: свои устройства без значения токена;
+    - destroy: удалить своё устройство по uuid;
+    - revoke: удалить по значению токена — нужно при logout, когда uuid клиента
+      неизвестен (приложение после переустановки).
+
+    PUT/PATCH нет: токен не «редактируют», его либо регистрируют заново, либо
+    забывают — как `http_method_names` в ChatViewSet.
+    """
+
+    permission_classes = [IsAuthenticated]
+    http_method_names = ["get", "post", "delete"]
+
+    ACTION_THROTTLE_SCOPES = {
+        "create": "devices",
+        "revoke": "devices",
+    }
+
+    queryset = DeviceToken.objects.none()
+
+    def get_throttles(self):
+        self.throttle_scope = self.ACTION_THROTTLE_SCOPES.get(self.action)
+        return super().get_throttles()
+
+    def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return DeviceToken.objects.none()
+        # Пользователь видит и удаляет только свои строки: чужой uuid даёт 404,
+        # а не 403 — иначе список устройств стал бы вектором enumeration.
+        return DeviceToken.objects.filter(user=self.request.user)
+
+    def get_serializer_class(self):
+        if self.action == "create":
+            return DeviceTokenCreateSerializer
+        if self.action == "revoke":
+            return DeviceRevokeSerializer
+        return DeviceTokenSerializer
+
+    @extend_schema(
+        summary="Зарегистрировать push-токен устройства",
+        description=(
+            "upsert по значению токена: 200 и `created: true` при первом виде, "
+            "200 и `created: false` при повторе. Токен привязан к паре "
+            "(приложение, устройство), поэтому вход с другого аккаунта на том же "
+            "телефоне ПЕРЕПРИВЯЗЫВАЕТ строку к новому владельцу и заодно "
+            "восстанавливает `is_active` после деактивации."
+        ),
+        request=DeviceTokenCreateSerializer,
+        responses={
+            200: OpenApiResponse(
+                response=DeviceTokenSerializer,
+                description="Устройство зарегистрировано (в ответе есть поле `created`)",
+            ),
+            400: OpenApiResponse(
+                description="Токен не похож на FCM registration token"
+            ),
+        },
+    )
+    def create(self, request, *args, **kwargs):
+        serializer = DeviceTokenCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        device, created = DeviceToken.objects.update_or_create(
+            token=data["token"],
+            defaults={
+                "user": request.user,
+                "platform": data["platform"],
+                "app_version": data["app_version"],
+                # Повторная регистрация = устройство снова у нас; сбрасываем
+                # мягкое выключение, иначе push не придёт никогда.
+                "is_active": True,
+            },
+        )
+        return Response(
+            {**DeviceTokenSerializer(device).data, "created": created},
+            status=status.HTTP_200_OK,
+        )
+
+    @extend_schema(
+        summary="Мои устройства",
+        description="Список зарегистрированных устройств; значение токена не отдаётся.",
+        responses={200: DeviceTokenSerializer(many=True)},
+    )
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+
+    @extend_schema(
+        summary="Забыть устройство по uuid",
+        responses={
+            204: OpenApiResponse(description="Устройство удалено"),
+            404: OpenApiResponse(description="Такое устройство не принадлежит вам"),
+        },
+    )
+    def destroy(self, request, *args, **kwargs):
+        return super().destroy(request, *args, **kwargs)
+
+    @extend_schema(
+        summary="Забыть устройство по токену",
+        description=(
+            "Идемпотентно: 204 и когда строки не было (в т.ч. когда токен уже "
+            "перепривязан к другому аккаунту). Удаляется только своя строка — "
+            "чужое устройство этим запросом не выключить."
+        ),
+        request=DeviceRevokeSerializer,
+        responses={
+            204: OpenApiResponse(description="Устройство забыто"),
+            400: OpenApiResponse(
+                description="Токен не похож на FCM registration token"
+            ),
+        },
+    )
+    @action(detail=False, methods=["post"], url_path="revoke")
+    def revoke(self, request):
+        serializer = DeviceRevokeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        DeviceToken.objects.filter(
+            user=request.user, token=serializer.validated_data["token"]
+        ).delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class PushTestView(APIView):
+    """
+    Тестовое уведомление на активные устройства текущего пользователя.
+
+    Нужен, чтобы проверять свой пайплайн (права, канал, навигацию), не собирая
+    кампанию вручную в Firebase Console. Делает реальный вызов FCM в потоке
+    запроса — из-за этого лимит 5/мин, а не «дешёвый» диагностический рид.
+    """
+
+    permission_classes = [IsAuthenticated]
+    throttle_scope = "push_test"
+
+    @extend_schema(
+        summary="Отправить тестовый push на свои устройства",
+        description=(
+            "503, если push выключен (`PUSH_ENABLED=0`) или не настроен креденшел; "
+            "`reason: no_tokens` — когда у пользователя нет активных устройств. "
+            "Data-тип уведомления — `test`, навигации клиент по нему не строит."
+        ),
+        request=TestPushSerializer,
+        responses={
+            200: OpenApiResponse(description="Отчёт об отправке"),
+            400: OpenApiResponse(description="Ошибка валидации текста"),
+            502: OpenApiResponse(description="FCM не ответил"),
+            503: OpenApiResponse(description="Push не включён или не настроен"),
+        },
+    )
+    def post(self, request):
+        serializer = TestPushSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        if not push_enabled():
+            return Response(
+                {"detail": "Push выключен: установите PUSH_ENABLED=1"},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        try:
+            summary = send_test_push(
+                str(request.user.id),
+                title=serializer.validated_data["title"],
+                body=serializer.validated_data["body"],
+            )
+        except PushNotConfigured as error:
+            return Response(
+                {"detail": f"Push не настроен: {error}"},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except RuntimeError as error:
+            return Response(
+                {"detail": str(error)},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        return Response(summary)
